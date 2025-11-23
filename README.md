@@ -15,4 +15,4 @@ consider a small donation in crypto currencies or buy me a coffee.
 <a href="https://www.buymeacoffee.com/Ch1ffr3punk" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/default-yellow.png" alt="Buy Me A Coffee" height="41" width="174"></a>
 
 
-NymView is dedicated to the awsome [Nym](https://nym.com/mixnet) community.
+NymView is dedicated to the awesome [Nym](https://nym.com/mixnet) community.
