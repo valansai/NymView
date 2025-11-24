@@ -16,7 +16,7 @@ struct Cli {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let mut server = mixnet_server::NymMixnetServer::new(&cli.directory).await?;
-    println!("Server address: {}", server.get_nym_address());
     server.start().await?;
     Ok(())
 }
+
