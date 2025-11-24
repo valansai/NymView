@@ -20,9 +20,7 @@ impl NymMixnetServer {
         // PERSISTENT CLIENT with configuration directory
         let config_dir = config::ensure_config_dir()?;
         let client_path = config_dir.join("mixnet_client");
-        
-        println!("Persistent client path: {:?}", client_path);
-        
+                
         // FIXED: Final API with type conversion
         let storage_paths = nym_sdk::mixnet::StoragePaths::new_from_dir(&client_path)?;
         let storage = nym_sdk::mixnet::OnDiskPersistent::from_paths(
@@ -44,9 +42,8 @@ impl NymMixnetServer {
         
         let cache = Self::load_sites_into_cache(&sites_dir).await?;
         
-        println!("NymView Server started: {}", nym_address);
+        println!("NymView Server started: nym://{}", nym_address);
         println!("Hosting from: {:?}", sites_dir);
-        println!("Persistent keys saved in: {:?}", config_dir);
         
         Ok(Self {
             nym_client: connected_client,
@@ -186,3 +183,4 @@ impl NymMixnetServer {
         &self.nym_address
     }
 }
+
