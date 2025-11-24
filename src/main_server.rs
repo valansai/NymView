@@ -1,5 +1,6 @@
 use clap::Parser;
 
+mod default_page;
 mod mixnet_server;
 mod config;
 

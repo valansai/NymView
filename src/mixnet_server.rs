@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
 use std::sync::Arc;
 use crate::config;
+use crate::default_page;
 
 pub struct NymMixnetServer {
     nym_client: mixnet::MixnetClient,
@@ -78,25 +79,10 @@ impl NymMixnetServer {
         
         // Default homepage if no index.md exists
         if !cache.contains_key("index") {
-            cache.insert("index".to_string(), 
-            r#"# Welcome to NymView Server
-
-This server hosts pages via the **Nym Mixnet**.
-
-## Available Pages
-
-- Place `.md` files in the sites directory  
-- Example: `about.md` → accessible at `/about`
-
-## External Links
-
-- [Nym News](nym://5CDQAbHuc...K8LtT7jKGjVJCuNym/news)
-- [Community](nym://abc123.../community)
-
-> Tip: Use Markdown syntax for formatting!
-"#.to_string());
+            cache.insert("index".to_string(), default_page::default_index().to_string());
+            println!("Serving default index page");
         }
-
+        
         Ok(cache)
     }
     
