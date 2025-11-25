@@ -96,84 +96,95 @@ impl NymMixnetServer {
         println!("Server listening...");
 
         let socket = Arc::new(tokio::sync::Mutex::new(&mut self.nym_socket));
+        let socket_for_shutdown = socket.clone();
         
-        loop {
+        tokio::select! {
+            _ = async {
+                loop {
 
+                    // Collect all pending messages from the receive queue
+                    let messages: Vec<_> = {
+                        let mut guard = socket.lock().await;
+                        let mut recv = guard.recv.lock().await;
+                        recv.drain(..).collect()
+                    };
 
-            // Collect all pending messages from the receive queue
-            let messages: Vec<_> = {
-                let mut guard = socket.lock().await;
-                let mut recv = guard.recv.lock().await;
-                recv.drain(..).collect()
-            };
+                    // Process each received message
+                    for msg in messages {
+                        let mut stream = DataStream::default();
+                        let _ = stream.write(&msg.data);
 
-            // Process each received message
-            for msg in messages {
-                let mut stream = DataStream::default();
-                let _ = stream.write(&msg.data);
+                        // Read the command from the stream
+                        let command = match stream.stream_out::<String>() {
+                            Ok(cmd) => cmd,
+                            Err(_) => {
+                                println!("Invalid message format: missing command");
+                                continue;
+                            }
+                        };
 
+                        match command.as_str() {
+                            // Handle the ASK command (request for a page)
+                            config::COMMANDS::ASK => {
 
-                // Read the command from the stream
-                let command = match stream.stream_out::<String>() {
-                    Ok(cmd) => cmd,
-                    Err(_) => {
-                        println!("Invalid message format: missing command");
-                        continue;
+                                // Read the request ID from the stream
+                                let request_id = match stream.stream_out::<Vec<u8>>() {
+                                    Ok(id) => id,
+                                    Err(_) => continue,
+                                };
+
+                                // Read the requested page path from the stream
+                                let request_page = match stream.stream_out::<String>() {
+                                    Ok(page) => page,
+                                    Err(_) => continue,
+                                };
+
+                                // Read the current cached pages
+                                let cache = self.cache.read().await;
+
+                                // Look up the requested page in the cache: if it's not found, use the default 404 page
+                                let response = match cache.get(&request_page) {
+                                    Some(content) => content.clone(),
+                                    None => default_page::default_404().to_string(),
+                                };
+
+                                // Create a new DataStream for the response
+                                let mut response_stream = DataStream::default();           
+                                let _ = response_stream.stream_in(&config::COMMANDS::GET); // command
+                                let _ = response_stream.stream_in(&request_id);            // request ID
+                                let _ = response_stream.stream_in(&response);              // response
+
+                                // Send the response back to the sender
+                                let sent = {
+                                    let mut s = socket.lock().await;
+                                    s.send(response_stream.data, msg.from.clone()).await
+                                };
+                            }
+
+                            _ => {
+                                println!("Unknown command received: {}", command);
+                            }
+                        }
                     }
-                };
 
-                match command.as_str() {
-                    // Handle the ASK command (request for a page)
-                    config::COMMANDS::ASK => {
-
-
-                        // Read the request ID from the stream
-                        let request_id = match stream.stream_out::<Vec<u8>>() {
-                            Ok(id) => id,
-                            Err(_) => continue,  
-                        };
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                }
+            } => {},
 
 
-                        // Read the requested page path from the stream
-                        let request_page = match stream.stream_out::<String>() {
-                            Ok(page) => page,
-                            Err(_) => continue,  
-                        };
-
-
-                        // Read the current cached pages
-                        let cache = self.cache.read().await;
-                        
-                        // Look up the requested page in the cache: if it's not found, use the default 404 page
-                        let response = match cache.get(&request_page) {
-                            Some(content) => content.clone(),
-                            None => default_page::default_404().to_string(),
-                        };
-
-                        // Create a new DataStream for the response
-                        let mut response_stream = DataStream::default();
-                        let _ = response_stream.stream_in(&config::COMMANDS::GET); // command
-                        let _ = response_stream.stream_in(&request_id);            // request ID
-                        let _ = response_stream.stream_in(&response);              // response
-
-                        // Send the response back to the sender
-                        let sent = {
-                            let mut s = socket.lock().await; 
-                            s.send(response_stream.data, msg.from.clone()).await
-                        };
-
-                        println!("{:?} to {:?}", sent, msg.from.clone().to_string());
-                    }
-
-                    _ => {
-                        println!("Unknown command received: {}", command);
-                    }
-                }        
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nShutting down...");
             }
-            
-            
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
+
+        {
+            let mut guard = socket_for_shutdown.lock().await;
+            let _ = guard.disconnect().await;
+            println!("Nym socket disconnected.");
+        }
+
+        println!("Server stopped.");
+        Ok(())
     }
 
     
