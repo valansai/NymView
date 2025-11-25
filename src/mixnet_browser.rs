@@ -1,13 +1,18 @@
-use nym_sdk::mixnet;
-use nym_sdk::mixnet::MixnetMessageSender;
+use nymlib::nymsocket::{Socket, SockAddr, SocketMode};
+use nymlib::serialize::{DataStream, Serialize};
 use egui::{Ui, TextEdit, ScrollArea, Color32};
 use tokio::sync::mpsc;
 use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
 use std::sync::{Arc, Mutex};
 use std::sync::OnceLock;
+use std::io::Write;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use eframe::App;
+use rand::Rng;
+
+use crate::config;
+
 
 // Global runtime
 static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
@@ -20,7 +25,7 @@ static GUI_TO_MIXNET_SENDER: OnceLock<Arc<Mutex<Option<mpsc::UnboundedSender<Bro
 
 #[derive(Debug)]
 pub(crate) enum BrowserMessage {
-    SendRequest { recipient: String, message: String },
+    SendRequest { recipient: String, message: DataStream },
     ReceivedMessage { content: String, from: String },
     ConnectionStatus { status: String, loading: bool, client_address: String },
 }
@@ -31,6 +36,7 @@ pub(crate) struct HistoryEntry {
     page: String,
 }
 
+
 pub struct NymMixnetBrowser {
     pub address_bar: String,
     pub current_content: String,
@@ -40,16 +46,18 @@ pub struct NymMixnetBrowser {
     pub connection_status: String,
     pub server_address: String,
     pub client_address: String,
+    pub socket_mode: SocketMode,
     pub(crate) message_receiver: Option<mpsc::UnboundedReceiver<BrowserMessage>>,
     pub(crate) message_sender: Option<mpsc::UnboundedSender<BrowserMessage>>,
     pub(crate) history: Vec<HistoryEntry>,
     pub(crate) connection_attempted: bool,
     pub(crate) md_cache: CommonMarkCache,
     pub(crate) pending_navigation: Option<String>,
+    pub(crate) pending_request_id: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl NymMixnetBrowser {
-    pub fn new() -> Self {
+    pub fn new(socket_mode: SocketMode) -> Self {
         Self {
             address_bar: String::new(),
             current_content: String::new(),
@@ -59,12 +67,14 @@ impl NymMixnetBrowser {
             connection_status: "Connecting to Mixnet...".to_string(),
             server_address: String::new(),
             client_address: String::new(),
+            socket_mode: socket_mode,
             message_receiver: None,
             message_sender: None,
             history: Vec::new(),
             connection_attempted: false,
             md_cache: CommonMarkCache::default(),
             pending_navigation: None,
+            pending_request_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -80,8 +90,9 @@ impl NymMixnetBrowser {
 
     fn start_connection(&mut self) {
         if let Some(sender) = self.message_sender.clone() {
+            let browser = self.clone();
             RUNTIME.spawn(async move {
-                match Self::connect_with_status(sender).await {
+                match browser.connect_with_status(sender).await {
                     Ok(_) => println!("Connection successful"),
                     Err(e) => eprintln!("Connection failed: {}", e),
                 }
@@ -89,7 +100,8 @@ impl NymMixnetBrowser {
         }
     }
 
-    async fn connect_with_status(sender: mpsc::UnboundedSender<BrowserMessage>) -> Result<(), String> {
+    async fn connect_with_status(&self, sender: mpsc::UnboundedSender<BrowserMessage>) -> Result<(), String> {
+
         let _ = sender.send(BrowserMessage::ConnectionStatus {
             status: "Connecting to Mixnet...".to_string(),
             loading: true,
@@ -97,17 +109,19 @@ impl NymMixnetBrowser {
         });
 
         println!("Creating Mixnet Client...");
-        let client = mixnet::MixnetClientBuilder::new_ephemeral()
-            .build()
-            .map_err(|e| format!("Client creation error: {}", e))?;
+        
+        let socket = Socket::new_ephemeral(self.socket_mode)
+            .await
+            .ok_or("Unable to build mixnet client")?;
 
         println!("Client created, connecting to Mixnet...");
-        let connected_client = client
-            .connect_to_mixnet()
-            .await
-            .map_err(|e| format!("Connection error: {}", e))?;
 
-        let client_address = connected_client.nym_address().to_string();
+        let mut listener = socket.clone();
+        tokio::spawn(async move {
+            listener.listen().await;
+        });
+
+        let client_address = socket.getsockaddr().await.unwrap().to_string();
         println!("Connected!");
 
         let _ = sender.send(BrowserMessage::ConnectionStatus {
@@ -121,57 +135,129 @@ impl NymMixnetBrowser {
         *GUI_TO_MIXNET_SENDER.get().unwrap().lock().unwrap() = Some(gui_to_mixnet_tx);
 
         RUNTIME.spawn(Self::mixnet_task(
-            connected_client,
+            socket,
             gui_to_mixnet_rx,
             sender,
+            self.pending_request_id.clone()
         ));
 
         Ok(())
     }
 
+    
     async fn mixnet_task(
-        mut client: mixnet::MixnetClient,
+        socket: Socket,
         mut from_gui: mpsc::UnboundedReceiver<BrowserMessage>,
         to_gui: mpsc::UnboundedSender<BrowserMessage>,
+        pending_request_id: Arc<Mutex<Option<Vec<u8>>>>,
     ) {
+        let socket = Arc::new(tokio::sync::Mutex::new(socket));
+        let socket_for_recv = socket.clone();
+
         loop {
             tokio::select! {
-                messages = client.wait_for_messages() => {
-                    if let Some(messages) = messages {
-                        for received in messages {
-                            let text_message = String::from_utf8_lossy(&received.message).into_owned();
-                            let sender_info = if let Some(sender_tag) = &received.sender_tag {
-                                format!("{:?}", sender_tag)
-                            } else {
-                                "unknown".to_string()
+                // Handle incoming messages from the Mixnet receive queue
+                messages = async {
+                    let messages: Vec<_> = {
+                        let mut guard = socket_for_recv.lock().await;
+                        let mut recv = guard.recv.lock().await;
+                        recv.drain(..).collect()
+                    };
+                    messages
+                } => {
+                    if !messages.is_empty() {
+                        // Process each received message
+                        for msg in messages {
+                            let mut stream = DataStream::default();
+                            let _ = stream.write(&msg.data);
+
+                            // Read the command from the stream
+                            let command = match stream.stream_out::<String>() {
+                                Ok(cmd) => cmd,
+                                Err(_) => {
+                                    continue;
+                                }
                             };
-                            let _ = to_gui.send(BrowserMessage::ReceivedMessage {
-                                content: text_message,
-                                from: sender_info,
-                            });
+
+                            match command.as_str() {
+                                // Handle the GET command (response to a requseted page)
+                                config::COMMANDS::GET => {
+
+                                    // Read the request ID from the stream
+                                    let request_id = match stream.stream_out::<Vec<u8>>() {
+                                        Ok(id) => id,
+                                        Err(_) => continue,  
+                                    };
+
+                                    // Read the response from the stream
+                                    let content = match stream.stream_out::<String>() {
+                                        Ok(content) => content,
+                                        Err(_) => continue,  
+                                    };
+
+                                    // Determine if the response matches the current pending request
+                                    let accept = {
+                                        let pending_id = pending_request_id.lock().unwrap().clone();
+                                        if let Some(pending) = pending_id {
+                                            pending == request_id
+                                        } else {
+                                            println!("Received content for unknown request_id {:?}", request_id);
+                                            false
+                                        }
+                                    };
+
+
+                                    if accept {
+                                        // Forward the content to the GUI if the request ID matches
+                                        let _ = to_gui.send(BrowserMessage::ReceivedMessage {
+                                            content,
+                                            from: msg.from.to_string(),
+                                        });
+
+
+                                        // Clear the pending request ID after processing
+                                        *pending_request_id.lock().unwrap() = None;
+                                    }
+                                }
+
+                                _ => {
+                                    println!("Unknown command received: {}", command);
+                                }
+                            }        
                         }
                     }
                 }
+                
+                // Handle messages sent from the GUI
                 Some(gui_message) = from_gui.recv() => {
                     if let BrowserMessage::SendRequest { recipient, message } = gui_message {
-                        match recipient.parse::<nym_sdk::mixnet::Recipient>() {
-                            Ok(recipient_addr) => {
-                                if let Err(e) = client.send_plain_message(recipient_addr, message).await {
-                                    eprintln!("Error sending: {}", e);
-                                    let _ = to_gui.send(BrowserMessage::ReceivedMessage {
-                                        content: format!("ERROR: {}", e),
-                                        from: "system".to_string(),
-                                    });
-                                }
-                                // Keine "Request sent successfully" Ausgabe mehr
-                            }
-                            Err(e) => {
-                                eprintln!("Invalid recipient address: {}", e);
-                                let _ = to_gui.send(BrowserMessage::ReceivedMessage {
-                                    content: format!("ERROR: Invalid address - {}", e),
-                                    from: "system".to_string(),
-                                });
-                            }
+                        // Parse the recipient address into a SockAddr
+                        let sock_addr = SockAddr::from(recipient.as_str());
+
+                        // Validation check 
+                        if sock_addr.is_null() {
+                            let _ = to_gui.send(BrowserMessage::ReceivedMessage {
+                                content: "ERROR: Invalid address".to_string(),
+                                from: "system".to_string(),
+                            });
+                            continue;
+                        }
+
+                        // Sent the request
+                        let sent = {
+                            let mut s = socket.lock().await;
+                            s.extra_surbs = Some(5); // TODO
+                            s.send(message.data, sock_addr).await
+                        };
+
+                        if sent {
+                            println!("Sent request to {recipient}");
+                        } else {
+                            // 
+                            let _ = to_gui.send(BrowserMessage::ReceivedMessage {
+                                content: "ERROR: Failed to send (mixnet down?)".to_string(),
+                                from: "local".to_string(),
+                            });
                         }
                     }
                 }
@@ -179,32 +265,42 @@ impl NymMixnetBrowser {
         }
     }
 
+
     fn get_gui_sender() -> Option<mpsc::UnboundedSender<BrowserMessage>> {
         GUI_TO_MIXNET_SENDER
             .get()
             .and_then(|arc| arc.lock().unwrap().clone())
     }
 
-    pub fn send_request(&self, request_path: &str) -> Result<(), String> {
+    pub fn send_request(&mut self, request_path: &str) -> Result<(), String> {
+        // Read the server address
         let recipient = self.server_address.trim();
         if recipient.is_empty() {
             return Err("No server address specified".to_string());
         }
-        let my_address = self.client_address.trim();
-        if my_address.is_empty() {
-            return Err("Not connected yet - waiting for client address".to_string());
-        }
 
-        let request = format!("GET {} FROM {}", request_path, my_address);
 
+        // Create an unique request id 
+        let request_id: Vec<u8> = (0..16).map(|_| rand::thread_rng().gen()).collect();
+
+        // Create a new DataStream for the request
+        let mut request_stream = DataStream::default();          
+        let _ = request_stream.stream_in(&config::COMMANDS::ASK); // command
+        let _ = request_stream.stream_in(&request_id);            // request ID
+        let _ = request_stream.stream_in(&request_path);          // page path
+
+        // Send the request via the GUI sender
         if let Some(sender) = Self::get_gui_sender() {
             sender.send(BrowserMessage::SendRequest {
                 recipient: recipient.to_string(),
-                message: request,
+                message: request_stream,
             }).map_err(|e| format!("Send error: {}", e))?;
         } else {
             return Err("Not connected to Mixnet".to_string());
         }
+
+        *self.pending_request_id.lock().unwrap() = Some(request_id.clone());
+
         Ok(())
     }
 
@@ -237,11 +333,11 @@ impl NymMixnetBrowser {
         self.page_loading = true;
 
         let path = if self.address_bar.is_empty() {
-            "/".to_string()
+            "index".to_string()
         } else if self.address_bar.starts_with('/') {
             self.address_bar.clone()
         } else {
-            format!("/{}", self.address_bar)
+            format!("{}", self.address_bar)
         };
 
         match self.send_request(&path) {
@@ -288,18 +384,7 @@ impl NymMixnetBrowser {
             }
         }
 
-        // Status line
-        ui.horizontal(|ui| {
-            ui.label("Status:");
-            ui.colored_label(Color32::BLUE, &self.connection_status);
-            if self.loading {
-                ui.spinner();
-                ui.colored_label(Color32::BLUE, "Connecting...");
-            }
-        });
-
-        ui.separator();
-
+    
         // Address bar with responsive design
         ui.horizontal(|ui| {
             if ui.button("←").clicked() && self.history.len() > 1 {
@@ -367,6 +452,27 @@ impl NymMixnetBrowser {
                     }
                 }
             }
+        });
+
+        egui::TopBottomPanel::bottom("footer_panel").show(ui.ctx(), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Status:");
+                if self.loading {
+                    ui.spinner();
+                    ui.colored_label(Color32::BLUE, "Connecting...");
+                }
+                else{
+                    ui.colored_label(Color32::BLUE, &self.connection_status);
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mode_label = match self.socket_mode {
+                        SocketMode::Individual => "Pseudonymous".to_string(),
+                        _ => format!("{:?}", self.socket_mode),
+                    };
+                    ui.label(format!("Mode: {}", mode_label));
+                });
+            });
         });
     }
 
@@ -561,12 +667,16 @@ impl Clone for NymMixnetBrowser {
             connection_status: self.connection_status.clone(),
             server_address: self.server_address.clone(),
             client_address: self.client_address.clone(),
+            socket_mode: self.socket_mode,
             message_receiver: None,
             message_sender: None,
             history: self.history.clone(),
             connection_attempted: self.connection_attempted,
             md_cache: CommonMarkCache::default(),
             pending_navigation: None,
+            pending_request_id: self.pending_request_id.clone(),
         }
     }
 }
+
+

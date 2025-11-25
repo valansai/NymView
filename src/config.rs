@@ -13,3 +13,9 @@ pub fn ensure_config_dir() -> std::io::Result<PathBuf> {
     println!("Persistence directory: {:?}", config_dir);
     Ok(config_dir)
 }
+
+
+pub mod COMMANDS {
+    pub const ASK: &str = "ASK";
+    pub const GET: &str = "GET";   
+}

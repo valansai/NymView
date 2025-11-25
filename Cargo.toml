@@ -10,10 +10,10 @@ egui_commonmark = { version = "0.22", features = ["embedded_image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 tokio = { version = "1", features = ["full"] }
 once_cell = "1.19"
-nym-sdk = { git = "https://github.com/nymtech/nym", branch = "master" }
 clap = "4"
 dirs = "5"
-ed25519-zebra = { version = "4.1", features = ["alloc"] }
+nymlib = { git = "https://github.com/valansai/nymlib", branch = "main" }
+rand = "0.8"
 
 [[bin]]
 name = "nym-view-server"

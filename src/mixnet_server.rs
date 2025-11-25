@@ -1,15 +1,18 @@
-use nym_sdk::mixnet;
-use nym_sdk::mixnet::MixnetMessageSender;
+use nymlib::nymsocket::{Socket, SockAddr, SocketMode};
+use nymlib::serialize::{DataStream, Serialize};
+
 use std::collections::HashMap;
+use std::io::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
 use std::sync::Arc;
+
 use crate::config;
 use crate::default_page;
 
 pub struct NymMixnetServer {
-    nym_client: mixnet::MixnetClient,
+    nym_socket: Socket,
     sites_dir: PathBuf,
     pub nym_address: String,
     cache: Arc<RwLock<HashMap<String, String>>>,
@@ -19,21 +22,19 @@ impl NymMixnetServer {
     pub async fn new(sites_directory: &str) -> Result<Self, Box<dyn std::error::Error>> {
         // PERSISTENT CLIENT with configuration directory
         let config_dir = config::ensure_config_dir()?;
-        let client_path = config_dir.join("mixnet_client");
-                
-        // FIXED: Final API with type conversion
-        let storage_paths = nym_sdk::mixnet::StoragePaths::new_from_dir(&client_path)?;
-        let storage = nym_sdk::mixnet::OnDiskPersistent::from_paths(
-            storage_paths.into(), // .into() for type conversion
-            &Default::default(),
-        ).await?;
+        let client_path = config_dir.join(sites_directory);
+        let client_path_str = client_path.to_str()
+            .ok_or("Config path contains invalid UTF-8")?;
+
+        let socket = Socket::new_standard(client_path_str, SocketMode::Individual)
+            .await
+            .ok_or("No gateway reachable")?;
+
+        let nym_address = socket.getsockaddr()
+            .await.unwrap()
+            .to_string();
         
-        let client = mixnet::MixnetClientBuilder::new_with_storage(storage)
-            .build()?;
-        
-        let connected_client = client.connect_to_mixnet().await?;
-        let nym_address = connected_client.nym_address().to_string();
-        
+
         let sites_dir = PathBuf::from(sites_directory);
         if !sites_dir.exists() {
             fs::create_dir_all(&sites_dir)?;
@@ -46,7 +47,7 @@ impl NymMixnetServer {
         println!("Hosting from: {:?}", sites_dir);
         
         Ok(Self {
-            nym_client: connected_client,
+            nym_socket: socket,
             sites_dir,
             nym_address,
             cache: Arc::new(RwLock::new(cache)),
@@ -84,83 +85,97 @@ impl NymMixnetServer {
     }
     
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+
+
+        // Listening for incoming messages
+        let mut listener = self.nym_socket.clone();
+        tokio::spawn(async move {
+            listener.listen().await;
+        });
+
         println!("Server listening...");
+
+        let socket = Arc::new(tokio::sync::Mutex::new(&mut self.nym_socket));
         
         loop {
-            if let Some(messages) = self.nym_client.wait_for_messages().await {
-                for received in messages {
-                    if let Ok(text_message) = String::from_utf8(received.message.clone()) {
-                        let (response, reply_to) = self.handle_request(&text_message).await;
-                        
-                        if let Some(target) = reply_to {
-                            match target.parse::<nym_sdk::mixnet::Recipient>() {
-                                Ok(recipient) => {
-                                    if let Err(e) = self.nym_client.send_plain_message(recipient, response).await {
-                                        eprintln!("Error sending response: {}", e);
-                                    }
-                                    // Keine "Response sent successfully" Ausgabe mehr
-                                }
-                                Err(e) => {
-                                    eprintln!("Invalid response address: {}", e);
-                                }
-                            }
-                        } else {
-                            eprintln!("No response address in request");
-                        }
+
+
+            // Collect all pending messages from the receive queue
+            let messages: Vec<_> = {
+                let mut guard = socket.lock().await;
+                let mut recv = guard.recv.lock().await;
+                recv.drain(..).collect()
+            };
+
+            // Process each received message
+            for msg in messages {
+                let mut stream = DataStream::default();
+                let _ = stream.write(&msg.data);
+
+
+                // Read the command from the stream
+                let command = match stream.stream_out::<String>() {
+                    Ok(cmd) => cmd,
+                    Err(_) => {
+                        println!("Invalid message format: missing command");
+                        continue;
                     }
-                }
+                };
+
+                match command.as_str() {
+                    // Handle the ASK command (request for a page)
+                    config::COMMANDS::ASK => {
+
+
+                        // Read the request ID from the stream
+                        let request_id = match stream.stream_out::<Vec<u8>>() {
+                            Ok(id) => id,
+                            Err(_) => continue,  
+                        };
+
+
+                        // Read the requested page path from the stream
+                        let request_page = match stream.stream_out::<String>() {
+                            Ok(page) => page,
+                            Err(_) => continue,  
+                        };
+
+
+                        // Read the current cached pages
+                        let cache = self.cache.read().await;
+                        
+                        // Look up the requested page in the cache: if it's not found, use the default 404 page
+                        let response = match cache.get(&request_page) {
+                            Some(content) => content.clone(),
+                            None => default_page::default_404().to_string(),
+                        };
+
+                        // Create a new DataStream for the response
+                        let mut response_stream = DataStream::default();
+                        let _ = response_stream.stream_in(&config::COMMANDS::GET); // command
+                        let _ = response_stream.stream_in(&request_id);            // request ID
+                        let _ = response_stream.stream_in(&response);              // response
+
+                        // Send the response back to the sender
+                        let sent = {
+                            let mut s = socket.lock().await; 
+                            s.send(response_stream.data, msg.from.clone()).await
+                        };
+
+                        println!("{:?} to {:?}", sent, msg.from.clone().to_string());
+                    }
+
+                    _ => {
+                        println!("Unknown command received: {}", command);
+                    }
+                }        
             }
+            
             
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
     }
-    
-    async fn handle_request(&self, request: &str) -> (String, Option<String>) {
-        // Search for " FROM " from the back (in case path contains spaces)
-        if let Some(from_pos) = request.rfind(" FROM ") {
-            let actual_request = &request[..from_pos];
-            let client_address = request[from_pos + 6..].trim().to_string();
-            
-            let response = self.process_command(actual_request).await;
-            (response, Some(client_address))
-        } else {
-            // Old requests or errors
-            let response = "ERROR: Request must be 'GET /path FROM your_address'".to_string();
-            (response, None)
-        }
-    }
-    
-    async fn process_command(&self, request: &str) -> String {
-        let parts: Vec<&str> = request.splitn(2, ' ').collect();
-        if parts.len() != 2 {
-            return "ERROR: Invalid request format".to_string();
-        }
-        
-        let command = parts[0];
-        let path = parts[1].trim();
-        
-        match command {
-            "GET" => self.serve_page(path).await,
-            "LIST" => self.list_pages().await,
-            "PING" => "PONG".to_string(),
-            "RELOAD" => self.reload_cache().await,
-            _ => format!("ERROR: Unknown command: {}", command),
-        }
-    }
-    
-    async fn serve_page(&self, path: &str) -> String {
-        let clean_path = if path == "/" { "index" } else { path.trim_start_matches('/') };
-        
-        let cache = self.cache.read().await;
-        match cache.get(clean_path) {
-            Some(content) => {
-                format!("OK\n{}", content)
-            }
-            None => {
-                format!("ERROR: Page '{}' not found", clean_path)
-            }
-        }
-    }
+
     
     async fn list_pages(&self) -> String {
         let cache = self.cache.read().await;
@@ -183,4 +198,3 @@ impl NymMixnetServer {
         &self.nym_address
     }
 }
-
