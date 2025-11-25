@@ -568,12 +568,9 @@ impl NymMixnetBrowser {
         });
         
         self.page_loading = true;
-        let request_path = if path.starts_with('/') { 
-            path.to_string() 
-        } else { 
-            format!("/{}", path) 
-        };
         
+        let request_path = path.trim().trim_start_matches('/').to_string();
+
         match self.send_request(&request_path) {
             Ok(()) => {
                 self.address_bar = path.to_string();
